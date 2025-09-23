@@ -6,12 +6,16 @@ Advanced implementation with quality optimizations for photogrammetry.
 
 import numpy as np
 import cv2
+import argparse
+import time
+import math
+import multiprocessing as mp
 from pathlib import Path
 from typing import Optional, Tuple, List
 import logging
 from concurrent.futures import ThreadPoolExecutor
-import multiprocessing as mp
-import time
+import psutil
+import gc
 
 try:
     import bm3d
@@ -38,16 +42,25 @@ logger = logging.getLogger(__name__)
 class EnhancedBM3DDenoiser:
     """Enhanced BM3D denoising optimized for aerial imagery DEM processing."""
 
-    def __init__(self, enable_yuv_processing: bool = True):
+    def __init__(
+        self,
+        enable_yuv_processing: bool = True,
+        tile_size: int = 2048,
+        overlap: int = 128,
+    ):
         """
         Initialize enhanced BM3D denoiser.
 
         Args:
             enable_yuv_processing: Use YUV colorspace for better perceptual quality
+            tile_size: Size of tiles for processing large images
+            overlap: Overlap between tiles for seamless blending
         """
         if not BM3D_AVAILABLE:
             raise ImportError("BM3D library is required")
         self.enable_yuv = enable_yuv_processing
+        self.tile_size = tile_size
+        self.overlap = overlap
 
     def estimate_noise_sigma(self, image: np.ndarray) -> float:
         """
@@ -232,6 +245,142 @@ class EnhancedBM3DDenoiser:
 
         return denoised, metadata
 
+    def process_image_tiled(
+        self, image: np.ndarray, sigma: Optional[float] = None
+    ) -> np.ndarray:
+        """Process large images using overlapping tiles to manage memory."""
+        if min(image.shape[:2]) <= self.tile_size:
+            return self.denoise_image_advanced(image, sigma)[0]
+
+        h, w = image.shape[:2]
+        channels = image.shape[2] if len(image.shape) == 3 else 1
+
+        # Calculate tile positions with overlap
+        tiles_y = math.ceil((h - self.overlap) / (self.tile_size - self.overlap))
+        tiles_x = math.ceil((w - self.overlap) / (self.tile_size - self.overlap))
+
+        result = np.zeros_like(image)
+        weight_map = np.zeros(image.shape[:2], dtype=np.float32)
+
+        logger.info(f"Processing {tiles_y}x{tiles_x} tiles for {h}x{w} image")
+
+        for ty in range(tiles_y):
+            for tx in range(tiles_x):
+                # Calculate tile bounds
+                y_start = ty * (self.tile_size - self.overlap)
+                x_start = tx * (self.tile_size - self.overlap)
+                y_end = min(y_start + self.tile_size, h)
+                x_end = min(x_start + self.tile_size, w)
+
+                # Extract tile
+                tile = image[y_start:y_end, x_start:x_end]
+
+                # Process tile
+                denoised_tile = self.denoise_image_advanced(tile, sigma)[0]
+
+                # Create weight mask for blending (higher in center)
+                tile_h, tile_w = denoised_tile.shape[:2]
+                weight = self._create_weight_mask(tile_h, tile_w)
+
+                # Accumulate results with weighted blending
+                if len(denoised_tile.shape) == 3:
+                    result[y_start:y_end, x_start:x_end] += (
+                        denoised_tile * weight[..., np.newaxis]
+                    )
+                else:
+                    result[y_start:y_end, x_start:x_end] += denoised_tile * weight
+                weight_map[y_start:y_end, x_start:x_end] += weight
+
+        # Normalize by accumulated weights
+        if len(result.shape) == 3:
+            result = result / weight_map[..., np.newaxis]
+        else:
+            result = result / weight_map
+        return result.astype(image.dtype)
+
+    def _create_weight_mask(self, h: int, w: int) -> np.ndarray:
+        """Create smooth weight mask for tile blending."""
+        mask = np.ones((h, w), dtype=np.float32)
+        fade_size = self.overlap // 2
+
+        if fade_size > 0:
+            # Apply fade to edges
+            if h > fade_size:
+                mask[:fade_size, :] *= np.linspace(0, 1, fade_size)[:, np.newaxis]
+                mask[-fade_size:, :] *= np.linspace(1, 0, fade_size)[:, np.newaxis]
+            if w > fade_size:
+                mask[:, :fade_size] *= np.linspace(0, 1, fade_size)
+                mask[:, -fade_size:] *= np.linspace(1, 0, fade_size)
+
+        return mask
+
+    def process_geotiff_file(
+        self, input_path: str, output_path: str, sigma: Optional[float] = None
+    ) -> dict:
+        """Process GeoTIFF files directly with spatial metadata preservation."""
+        try:
+            import rasterio
+            from rasterio.windows import Window
+        except ImportError:
+            raise ImportError(
+                "rasterio required for GeoTIFF processing. Install with: pip install rasterio"
+            )
+
+        start_time = time.time()
+
+        with rasterio.open(input_path) as src:
+            profile = src.profile.copy()
+
+            # Read image data
+            if src.count >= 3:
+                image = src.read([1, 2, 3])  # RGB channels
+                image = np.transpose(image, (1, 2, 0))  # HWC format
+            else:
+                raise ValueError(f"Need at least 3 bands, found {src.count}")
+
+            logger.info(f"Processing GeoTIFF {input_path} ({image.shape})")
+
+            # Normalize based on dtype
+            if image.dtype == np.uint16:
+                image = image.astype(np.float32) / 65535.0
+            elif image.dtype == np.uint8:
+                image = image.astype(np.float32) / 255.0
+            elif image.dtype in [np.float32, np.float64]:
+                image = image.astype(np.float32)
+                if image.max() > 1:
+                    image = image / image.max()
+
+            # Process with tiled approach
+            denoised = self.process_image_tiled(image, sigma)
+
+            # Convert back to original dtype
+            if profile["dtype"] == "uint16":
+                denoised = (np.clip(denoised, 0, 1) * 65535).astype(np.uint16)
+            elif profile["dtype"] == "uint8":
+                denoised = (np.clip(denoised, 0, 1) * 255).astype(np.uint8)
+            else:
+                denoised = denoised.astype(profile["dtype"])
+
+            # Update profile for efficient output
+            profile.update(
+                count=3, compress="lzw", tiled=True, blockxsize=512, blockysize=512
+            )
+
+            # Write output
+            denoised = np.transpose(denoised, (2, 0, 1))  # CHW format
+            with rasterio.open(output_path, "w", **profile) as dst:
+                dst.write(denoised)
+
+        processing_time = time.time() - start_time
+        logger.info(f"GeoTIFF processing completed in {processing_time:.2f}s")
+
+        return {
+            "input_path": input_path,
+            "output_path": output_path,
+            "processing_time": processing_time,
+            "image_shape": image.shape,
+        }
+
     def compute_enhanced_metrics(
         self, original: np.ndarray, denoised: np.ndarray
     ) -> dict:
@@ -386,9 +535,10 @@ class EnhancedBM3DDenoiser:
         sigma: Optional[float] = None,
         profile: str = "np",
         max_workers: Optional[int] = None,
+        max_memory_gb: float = 8.0,
     ) -> List[dict]:
         """
-        Multi-threaded batch processing for improved performance.
+        Multi-threaded batch processing with memory management.
 
         Args:
             input_dir: Input directory
@@ -397,6 +547,7 @@ class EnhancedBM3DDenoiser:
             sigma: Fixed noise level (auto-estimated per image if None)
             profile: BM3D profile
             max_workers: Maximum number of threads
+            max_memory_gb: Maximum memory per worker (GB)
 
         Returns:
             List of processing results
@@ -405,74 +556,145 @@ class EnhancedBM3DDenoiser:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        # Find images
-        files = list(input_path.glob(pattern))
+        # Find images - support both regular images and GeoTIFFs
+        files = []
+        for ext in [pattern, "*.tif", "*.tiff", "*.png", "*.bmp"]:
+            files.extend(list(input_path.glob(ext)))
+
+        # Remove duplicates while preserving order
+        seen = set()
+        files = [f for f in files if not (f in seen or seen.add(f))]
+
         logger.info(f"Found {len(files)} files to process")
 
         if not files:
-            logger.warning(f"No files found matching pattern {pattern}")
+            logger.warning(f"No files found matching patterns")
             return []
 
-        # Determine optimal number of workers
+        # Adaptive worker count based on memory
         if max_workers is None:
-            # Conservative threading for memory-intensive BM3D
-            max_workers = min(4, mp.cpu_count(), len(files))
+            try:
+                available_memory = psutil.virtual_memory().available / (1024**3)  # GB
+                max_workers = max(
+                    1, min(4, int(available_memory / max_memory_gb), len(files))
+                )
+            except:
+                max_workers = min(2, mp.cpu_count(), len(files))
 
-        logger.info(f"Using {max_workers} worker threads")
+        logger.info(
+            f"Using {max_workers} workers (available memory: {psutil.virtual_memory().available / (1024**3):.1f}GB)"
+        )
 
+        # Process in batches to prevent memory exhaustion
+        batch_size = max_workers * 2
+        results = []
+
+        for i in range(0, len(files), batch_size):
+            batch_files = files[i : i + batch_size]
+            logger.info(
+                f"Processing batch {i//batch_size + 1}/{math.ceil(len(files)/batch_size)}"
+            )
+            batch_results = self._process_batch_chunk(
+                batch_files, output_path, max_workers, sigma, profile
+            )
+            results.extend(batch_results)
+
+            # Force garbage collection between batches
+            gc.collect()
+
+        # Print summary
+        if results:
+            # Calculate metrics for results that have them
+            results_with_metrics = [
+                r
+                for r in results
+                if "quality_metrics" in r and "processing_metadata" in r
+            ]
+
+            if results_with_metrics:
+                avg_psnr = np.mean(
+                    [r["quality_metrics"]["psnr"] for r in results_with_metrics]
+                )
+                avg_texture = np.mean(
+                    [
+                        r["quality_metrics"]["texture_preservation"]
+                        for r in results_with_metrics
+                    ]
+                )
+                avg_time = np.mean(
+                    [
+                        r["processing_metadata"]["processing_time"]
+                        for r in results_with_metrics
+                    ]
+                )
+
+                logger.info(f"\nBatch processing summary:")
+                logger.info(f"Successfully processed: {len(results)}/{len(files)}")
+                logger.info(f"Average PSNR: {avg_psnr:.2f} dB")
+                logger.info(f"Average texture preservation: {avg_texture:.3f}")
+                logger.info(f"Average processing time: {avg_time:.2f}s per image")
+            else:
+                logger.info(f"Successfully processed: {len(results)}/{len(files)}")
+
+        return results
+
+    def _process_batch_chunk(
+        self,
+        files: List[Path],
+        output_dir: Path,
+        max_workers: int,
+        sigma: Optional[float],
+        profile: str,
+    ) -> List[dict]:
+        """Process a chunk of files with proper resource management."""
         results = []
         failed_files = []
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all jobs
-            future_to_file = {}
+            futures = {}
             for file_path in files:
-                output_file = output_path / f"denoised_{file_path.name}"
-                future = executor.submit(
-                    self.process_single_image,
-                    str(file_path),
-                    str(output_file),
-                    sigma=sigma,
-                    profile=profile,
-                )
-                future_to_file[future] = file_path
+                output_file = output_dir / f"denoised_{file_path.name}"
 
-            # Collect results
-            for future in future_to_file:
-                file_path = future_to_file[future]
+                # Check if it's a GeoTIFF
+                if file_path.suffix.lower() in [".tif", ".tiff"]:
+                    future = executor.submit(
+                        self.process_geotiff_file,
+                        str(file_path),
+                        str(output_file),
+                        sigma,
+                    )
+                else:
+                    future = executor.submit(
+                        self.process_single_image,
+                        str(file_path),
+                        str(output_file),
+                        sigma,
+                        profile,
+                    )
+                futures[future] = file_path
+
+            for future in futures:
+                file_path = futures[future]
                 try:
-                    result = future.result(timeout=300)  # 5 minute timeout per image
+                    result = future.result(timeout=600)  # 10-minute timeout per image
                     results.append(result)
 
-                    # Log metrics
-                    metrics = result["quality_metrics"]
-                    logger.info(
-                        f"✓ {file_path.name}: PSNR={metrics['psnr']:.2f}dB, "
-                        f"Texture={metrics['texture_preservation']:.3f}"
-                    )
+                    # Log metrics if available
+                    if "quality_metrics" in result:
+                        metrics = result["quality_metrics"]
+                        logger.info(
+                            f"✓ {file_path.name}: PSNR={metrics['psnr']:.2f}dB, "
+                            f"Noise reduction={metrics['noise_reduction_percent']:.1f}%"
+                        )
+                    else:
+                        logger.info(f"✓ {file_path.name}: Processed successfully")
 
                 except Exception as e:
                     logger.error(f"✗ Failed to process {file_path.name}: {e}")
                     failed_files.append(str(file_path))
 
-        # Print summary
-        if results:
-            avg_psnr = np.mean([r["quality_metrics"]["psnr"] for r in results])
-            avg_texture = np.mean(
-                [r["quality_metrics"]["texture_preservation"] for r in results]
-            )
-            avg_time = np.mean(
-                [r["processing_metadata"]["processing_time"] for r in results]
-            )
-
-            logger.info(f"\nBatch processing summary:")
-            logger.info(f"Successfully processed: {len(results)}/{len(files)}")
-            logger.info(f"Average PSNR: {avg_psnr:.2f} dB")
-            logger.info(f"Average texture preservation: {avg_texture:.3f}")
-            logger.info(f"Average processing time: {avg_time:.2f}s per image")
-
-            if failed_files:
-                logger.error(f"Failed files: {failed_files}")
+        if failed_files:
+            logger.warning(f"Failed to process {len(failed_files)} files in this batch")
 
         return results
 
@@ -513,11 +735,30 @@ def main():
         action="store_true",
         help="Disable YUV colorspace processing optimization",
     )
+    parser.add_argument(
+        "--tile-size",
+        type=int,
+        default=2048,
+        help="Tile size for large image processing",
+    )
+    parser.add_argument(
+        "--overlap",
+        type=int,
+        default=128,
+        help="Overlap between tiles for seamless blending",
+    )
+    parser.add_argument(
+        "--max-memory", type=float, default=8.0, help="Maximum memory per worker (GB)"
+    )
 
     args = parser.parse_args()
 
     # Initialize enhanced denoiser
-    denoiser = EnhancedBM3DDenoiser(enable_yuv_processing=not args.disable_yuv)
+    denoiser = EnhancedBM3DDenoiser(
+        enable_yuv_processing=not args.disable_yuv,
+        tile_size=args.tile_size,
+        overlap=args.overlap,
+    )
 
     if args.batch:
         # Batch processing
@@ -528,6 +769,7 @@ def main():
             sigma=args.sigma,
             profile=args.profile,
             max_workers=args.workers,
+            max_memory_gb=args.max_memory,
         )
 
         # Save detailed report
