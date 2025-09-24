@@ -96,6 +96,11 @@ class EnhancedBM3DDenoiser:
             mad = np.median(np.abs(laplacian - np.median(laplacian)))
             sigma = mad / 0.6745 / 255.0
 
+        # Handle NaN or invalid sigma values
+        if np.isnan(sigma) or sigma <= 0:
+            sigma = 0.01  # Default fallback for aerial imagery
+            logger.warning(f"Invalid sigma detected, using fallback: {sigma:.4f}")
+
         # Clamp sigma to reasonable range for aerial imagery
         sigma_clamped = float(np.clip(sigma, 0.001, 0.2))
 
@@ -214,12 +219,18 @@ class EnhancedBM3DDenoiser:
                             sigma,
                             stage_arg=bm3d.BM3DStages.HARD_THRESHOLDING,
                         )
-                        denoised[:, :, c] = bm3d.bm3d(
+                        # Extract just the image array if result is a tuple
+                        if isinstance(basic_estimate, tuple):
+                            basic_estimate = basic_estimate[0]
+                        result = bm3d.bm3d(
                             img_float[:, :, c],
                             sigma,
-                            basic_estimate,
-                            stage_arg=bm3d.BM3DStages.ALL_STAGES,
+                            stage_arg=basic_estimate,
                         )
+                        # Extract just the image array if result is a tuple
+                        if isinstance(result, tuple):
+                            result = result[0]
+                        denoised[:, :, c] = result
                     else:
                         # Single-stage BM3D with adaptive parameters
                         denoised[:, :, c] = bm3d.bm3d(img_float[:, :, c], sigma)
@@ -232,14 +243,24 @@ class EnhancedBM3DDenoiser:
                     basic_estimate = bm3d.bm3d(
                         img_float, sigma, stage_arg=bm3d.BM3DStages.HARD_THRESHOLDING
                     )
-                    denoised = bm3d.bm3d(
+                    # Extract just the image array if result is a tuple
+                    if isinstance(basic_estimate, tuple):
+                        basic_estimate = basic_estimate[0]
+                    result = bm3d.bm3d(
                         img_float,
                         sigma,
-                        basic_estimate,
-                        stage_arg=bm3d.BM3DStages.ALL_STAGES,
+                        stage_arg=basic_estimate,
                     )
+                    # Extract just the image array if result is a tuple
+                    if isinstance(result, tuple):
+                        result = result[0]
+                    denoised = result
                 else:
-                    denoised = bm3d.bm3d(img_float, sigma)
+                    result = bm3d.bm3d(img_float, sigma)
+                    # Extract just the image array if result is a tuple
+                    if isinstance(result, tuple):
+                        result = result[0]
+                    denoised = result
 
                 denoised = np.clip(denoised * 255.0, 0, 255).astype(np.uint8)
 
@@ -580,6 +601,13 @@ class EnhancedBM3DDenoiser:
                 )
             except:
                 max_workers = min(2, mp.cpu_count(), len(files))
+
+        # Force single worker for refilter profile to avoid BM3D threading issues
+        if profile == "refilter" and max_workers > 1:
+            logger.warning(
+                "Using single worker for refilter profile to avoid threading issues"
+            )
+            max_workers = 1
 
         logger.info(
             f"Using {max_workers} workers (available memory: {psutil.virtual_memory().available / (1024**3):.1f}GB)"

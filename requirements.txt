@@ -5,3 +5,4 @@ scikit-image
 rasterio
 psutil
 tqdm
+large-image[common]
