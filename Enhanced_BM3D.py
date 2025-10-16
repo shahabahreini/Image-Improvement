@@ -4,18 +4,19 @@ Enhanced BM3D Denoising for Aerial Images - DEM Processing Enhancement
 Advanced implementation with quality optimizations for photogrammetry.
 """
 
-import numpy as np
-import cv2
 import argparse
-import time
+import gc
+import logging
 import math
 import multiprocessing as mp
-from pathlib import Path
-from typing import Optional, Tuple, List
-import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import cv2
+import numpy as np
 import psutil
-import gc
 
 try:
     import bm3d
@@ -76,7 +77,6 @@ class EnhancedBM3DDenoiser:
 
         if SKIMAGE_AVAILABLE:
             if len(image.shape) == 3:
-                # Use luminance channel for more accurate noise estimation
                 gray = (
                     cv2.cvtColor((img_float * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
                     / 255.0
@@ -85,29 +85,92 @@ class EnhancedBM3DDenoiser:
             else:
                 sigma = estimate_sigma(img_float, channel_axis=None)
         else:
-            # Robust noise estimation using median absolute deviation
             gray = (
                 cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
                 if len(image.shape) == 3
                 else image
             )
             laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-            # Median absolute deviation method - more robust than variance
             mad = np.median(np.abs(laplacian - np.median(laplacian)))
             sigma = mad / 0.6745 / 255.0
 
-        # Handle NaN or invalid sigma values
         if np.isnan(sigma) or sigma <= 0:
-            sigma = 0.01  # Default fallback for aerial imagery
+            sigma = 0.01
             logger.warning(f"Invalid sigma detected, using fallback: {sigma:.4f}")
 
-        # Clamp sigma to reasonable range for aerial imagery
         sigma_clamped = float(np.clip(sigma, 0.001, 0.2))
 
         if sigma != sigma_clamped:
             logger.debug(f"Sigma clamped from {sigma:.4f} to {sigma_clamped:.4f}")
 
         return sigma_clamped
+
+    def _anscombe_forward(self, image: np.ndarray) -> np.ndarray:
+        """
+        Apply Anscombe variance-stabilizing transform.
+        Converts signal-dependent noise to approximately Gaussian with unit variance.
+
+        Args:
+            image: Input image in [0,1] range
+
+        Returns:
+            Transformed image
+        """
+        return 2.0 * np.sqrt(np.maximum(image, 0) + 3.0 / 8.0)
+
+    def _anscombe_inverse_exact(self, transformed: np.ndarray) -> np.ndarray:
+        """
+        Apply exact unbiased inverse Anscombe transform.
+        Prevents bias and banding in low-intensity regions.
+
+        Args:
+            transformed: Anscombe-transformed image
+
+        Returns:
+            Image in original domain [0,1]
+        """
+        z = transformed / 2.0
+        result = z**2 - 3.0 / 8.0
+
+        mask = z < 2.0
+        if np.any(mask):
+            result[mask] = 0.0
+
+        return np.clip(result, 0.0, 1.0)
+
+    def _estimate_dark_region_noise(self, image: np.ndarray) -> bool:
+        """
+        Detect if image has significant dark regions with noise.
+
+        Args:
+            image: Input image (float [0,1] or uint8)
+
+        Returns:
+            True if VST should be applied
+        """
+        img_float = image.astype(np.float32)
+        if img_float.max() > 1.0:
+            img_float = img_float / 255.0
+
+        if len(img_float.shape) == 3:
+            luminance = (
+                0.299 * img_float[:, :, 0]
+                + 0.587 * img_float[:, :, 1]
+                + 0.114 * img_float[:, :, 2]
+            )
+        else:
+            luminance = img_float
+
+        dark_mask = luminance < 0.2
+        dark_fraction = np.mean(dark_mask)
+
+        if dark_fraction > 0.1:
+            dark_pixels = luminance[dark_mask]
+            if len(dark_pixels) > 100:
+                dark_std = np.std(dark_pixels)
+                return dark_std > 0.02
+
+        return False
 
     def get_optimal_block_size(self, image_shape: Tuple[int, int], sigma: float) -> int:
         """
@@ -122,7 +185,6 @@ class EnhancedBM3DDenoiser:
         """
         min_dim = min(image_shape[:2])
 
-        # Adaptive block size based on image size and noise level
         if min_dim > 2048:
             block_size = 8 if sigma > 0.05 else 16
         elif min_dim > 1024:
@@ -144,27 +206,96 @@ class EnhancedBM3DDenoiser:
         Returns:
             Denoised image in BGR format
         """
-        # Convert to YUV (better separation of luminance and chrominance)
         yuv = cv2.cvtColor(image, cv2.COLOR_BGR2YUV).astype(np.float32) / 255.0
 
-        # Denoise Y channel (luminance) with full strength
         yuv[:, :, 0] = bm3d.bm3d(yuv[:, :, 0], sigma)
 
-        # Denoise U,V channels (chrominance) with reduced strength
-        # Human visual system is less sensitive to chrominance noise
         chroma_sigma = sigma * 0.5
         yuv[:, :, 1] = bm3d.bm3d(yuv[:, :, 1], chroma_sigma)
         yuv[:, :, 2] = bm3d.bm3d(yuv[:, :, 2], chroma_sigma)
 
-        # Convert back to BGR
         yuv_uint8 = np.clip(yuv * 255.0, 0, 255).astype(np.uint8)
         return cv2.cvtColor(yuv_uint8, cv2.COLOR_YUV2BGR)
+
+    def _denoise_with_vst(
+        self, image: np.ndarray, sigma: float, profile: str
+    ) -> np.ndarray:
+        """
+        Denoise using Variance Stabilizing Transform for dark region noise.
+
+        Args:
+            image: Input image in [0,1] range (float32)
+            sigma: Noise standard deviation
+            profile: BM3D profile
+
+        Returns:
+            Denoised image in [0,1] range
+        """
+        if len(image.shape) == 3:
+            denoised = np.zeros_like(image)
+            for c in range(3):
+                transformed = self._anscombe_forward(image[:, :, c])
+
+                vst_sigma = 1.0
+
+                if profile == "refilter":
+                    basic_estimate = bm3d.bm3d(
+                        transformed,
+                        vst_sigma,
+                        stage_arg=bm3d.BM3DStages.HARD_THRESHOLDING,
+                    )
+                    if isinstance(basic_estimate, tuple):
+                        basic_estimate = basic_estimate[0]
+                    result = bm3d.bm3d(
+                        transformed,
+                        vst_sigma,
+                        stage_arg=basic_estimate,
+                    )
+                    if isinstance(result, tuple):
+                        result = result[0]
+                    denoised_transformed = result
+                else:
+                    result = bm3d.bm3d(transformed, vst_sigma)
+                    if isinstance(result, tuple):
+                        result = result[0]
+                    denoised_transformed = result
+
+                denoised[:, :, c] = self._anscombe_inverse_exact(denoised_transformed)
+        else:
+            transformed = self._anscombe_forward(image)
+            vst_sigma = 1.0
+
+            if profile == "refilter":
+                basic_estimate = bm3d.bm3d(
+                    transformed,
+                    vst_sigma,
+                    stage_arg=bm3d.BM3DStages.HARD_THRESHOLDING,
+                )
+                if isinstance(basic_estimate, tuple):
+                    basic_estimate = basic_estimate[0]
+                result = bm3d.bm3d(
+                    transformed,
+                    vst_sigma,
+                    stage_arg=basic_estimate,
+                )
+                if isinstance(result, tuple):
+                    result = result[0]
+                denoised_transformed = result
+            else:
+                result = bm3d.bm3d(transformed, vst_sigma)
+                if isinstance(result, tuple):
+                    result = result[0]
+                denoised_transformed = result
+
+            denoised = self._anscombe_inverse_exact(denoised_transformed)
+
+        return denoised
 
     def denoise_image_advanced(
         self, image: np.ndarray, sigma: Optional[float] = None, profile: str = "np"
     ) -> Tuple[np.ndarray, dict]:
         """
-        Advanced BM3D denoising with optimized parameters.
+        Advanced BM3D denoising with VST for dark region noise handling.
 
         Args:
             image: Input image (uint8)
@@ -177,20 +308,20 @@ class EnhancedBM3DDenoiser:
         if not BM3D_AVAILABLE:
             raise RuntimeError("BM3D not available")
 
-        # Convert to float [0,1]
         img_float = image.astype(np.float32) / 255.0
 
-        # Estimate noise if not provided
         if sigma is None:
             sigma = self.estimate_noise_sigma(image)
             logger.info(f"Estimated noise sigma: {sigma:.4f}")
 
-        # Determine processing strategy
+        use_vst = self._estimate_dark_region_noise(img_float)
+
         use_yuv = (
             self.enable_yuv
             and len(image.shape) == 3
             and min(image.shape[:2]) > 1024
             and sigma < 0.08
+            and not use_vst
         )
 
         metadata = {
@@ -198,28 +329,30 @@ class EnhancedBM3DDenoiser:
             "profile": profile,
             "input_shape": image.shape,
             "input_dtype": str(image.dtype),
-            "processing_method": "YUV" if use_yuv else "RGB",
+            "processing_method": (
+                "VST+BM3D" if use_vst else ("YUV" if use_yuv else "RGB")
+            ),
             "block_size": self.get_optimal_block_size(image.shape, sigma),
         }
 
-        if use_yuv:
-            # Use YUV processing for large, low-noise images
+        if use_vst:
+            logger.info("Using VST+BM3D for dark region noise handling")
+            denoised = self._denoise_with_vst(img_float, sigma, profile)
+            denoised = np.clip(denoised * 255.0, 0, 255).astype(np.uint8)
+        elif use_yuv:
             logger.info("Using YUV colorspace processing")
             denoised = self.process_yuv_colorspace(image, sigma)
         else:
-            # Standard RGB processing
             if len(image.shape) == 3:
                 denoised = np.zeros_like(img_float)
                 for c in range(3):
                     if profile == "refilter":
-                        # Two-stage BM3D for maximum quality
                         logger.info(f"Applying two-stage BM3D to channel {c}")
                         basic_estimate = bm3d.bm3d(
                             img_float[:, :, c],
                             sigma,
                             stage_arg=bm3d.BM3DStages.HARD_THRESHOLDING,
                         )
-                        # Extract just the image array if result is a tuple
                         if isinstance(basic_estimate, tuple):
                             basic_estimate = basic_estimate[0]
                         result = bm3d.bm3d(
@@ -227,23 +360,18 @@ class EnhancedBM3DDenoiser:
                             sigma,
                             stage_arg=basic_estimate,
                         )
-                        # Extract just the image array if result is a tuple
                         if isinstance(result, tuple):
                             result = result[0]
                         denoised[:, :, c] = result
                     else:
-                        # Single-stage BM3D with adaptive parameters
                         denoised[:, :, c] = bm3d.bm3d(img_float[:, :, c], sigma)
 
-                # Convert back to uint8
                 denoised = np.clip(denoised * 255.0, 0, 255).astype(np.uint8)
             else:
-                # Grayscale processing
                 if profile == "refilter":
                     basic_estimate = bm3d.bm3d(
                         img_float, sigma, stage_arg=bm3d.BM3DStages.HARD_THRESHOLDING
                     )
-                    # Extract just the image array if result is a tuple
                     if isinstance(basic_estimate, tuple):
                         basic_estimate = basic_estimate[0]
                     result = bm3d.bm3d(
@@ -251,13 +379,11 @@ class EnhancedBM3DDenoiser:
                         sigma,
                         stage_arg=basic_estimate,
                     )
-                    # Extract just the image array if result is a tuple
                     if isinstance(result, tuple):
                         result = result[0]
                     denoised = result
                 else:
                     result = bm3d.bm3d(img_float, sigma)
-                    # Extract just the image array if result is a tuple
                     if isinstance(result, tuple):
                         result = result[0]
                     denoised = result
@@ -276,7 +402,6 @@ class EnhancedBM3DDenoiser:
         h, w = image.shape[:2]
         channels = image.shape[2] if len(image.shape) == 3 else 1
 
-        # Calculate tile positions with overlap
         tiles_y = math.ceil((h - self.overlap) / (self.tile_size - self.overlap))
         tiles_x = math.ceil((w - self.overlap) / (self.tile_size - self.overlap))
 
@@ -287,23 +412,18 @@ class EnhancedBM3DDenoiser:
 
         for ty in range(tiles_y):
             for tx in range(tiles_x):
-                # Calculate tile bounds
                 y_start = ty * (self.tile_size - self.overlap)
                 x_start = tx * (self.tile_size - self.overlap)
                 y_end = min(y_start + self.tile_size, h)
                 x_end = min(x_start + self.tile_size, w)
 
-                # Extract tile
                 tile = image[y_start:y_end, x_start:x_end]
 
-                # Process tile
                 denoised_tile = self.denoise_image_advanced(tile, sigma)[0]
 
-                # Create weight mask for blending (higher in center)
                 tile_h, tile_w = denoised_tile.shape[:2]
                 weight = self._create_weight_mask(tile_h, tile_w)
 
-                # Accumulate results with weighted blending
                 if len(denoised_tile.shape) == 3:
                     result[y_start:y_end, x_start:x_end] += (
                         denoised_tile * weight[..., np.newaxis]
@@ -312,7 +432,6 @@ class EnhancedBM3DDenoiser:
                     result[y_start:y_end, x_start:x_end] += denoised_tile * weight
                 weight_map[y_start:y_end, x_start:x_end] += weight
 
-        # Normalize by accumulated weights
         if len(result.shape) == 3:
             result = result / weight_map[..., np.newaxis]
         else:
@@ -325,7 +444,6 @@ class EnhancedBM3DDenoiser:
         fade_size = self.overlap // 2
 
         if fade_size > 0:
-            # Apply fade to edges
             if h > fade_size:
                 mask[:fade_size, :] *= np.linspace(0, 1, fade_size)[:, np.newaxis]
                 mask[-fade_size:, :] *= np.linspace(1, 0, fade_size)[:, np.newaxis]
@@ -352,16 +470,14 @@ class EnhancedBM3DDenoiser:
         with rasterio.open(input_path) as src:
             profile = src.profile.copy()
 
-            # Read image data
             if src.count >= 3:
-                image = src.read([1, 2, 3])  # RGB channels
-                image = np.transpose(image, (1, 2, 0))  # HWC format
+                image = src.read([1, 2, 3])
+                image = np.transpose(image, (1, 2, 0))
             else:
                 raise ValueError(f"Need at least 3 bands, found {src.count}")
 
             logger.info(f"Processing GeoTIFF {input_path} ({image.shape})")
 
-            # Normalize based on dtype
             if image.dtype == np.uint16:
                 image = image.astype(np.float32) / 65535.0
             elif image.dtype == np.uint8:
@@ -371,10 +487,8 @@ class EnhancedBM3DDenoiser:
                 if image.max() > 1:
                     image = image / image.max()
 
-            # Process with tiled approach
             denoised = self.process_image_tiled(image, sigma)
 
-            # Convert back to original dtype
             if profile["dtype"] == "uint16":
                 denoised = (np.clip(denoised, 0, 1) * 65535).astype(np.uint16)
             elif profile["dtype"] == "uint8":
@@ -382,13 +496,11 @@ class EnhancedBM3DDenoiser:
             else:
                 denoised = denoised.astype(profile["dtype"])
 
-            # Update profile for efficient output
             profile.update(
                 count=3, compress="lzw", tiled=True, blockxsize=512, blockysize=512
             )
 
-            # Write output
-            denoised = np.transpose(denoised, (2, 0, 1))  # CHW format
+            denoised = np.transpose(denoised, (2, 0, 1))
             with rasterio.open(output_path, "w", **profile) as dst:
                 dst.write(denoised)
 
@@ -418,11 +530,9 @@ class EnhancedBM3DDenoiser:
         orig_float = original.astype(np.float32)
         den_float = denoised.astype(np.float32)
 
-        # MSE and PSNR
         mse = np.mean((orig_float - den_float) ** 2)
         psnr = 20 * np.log10(255.0 / np.sqrt(mse)) if mse > 0 else float("inf")
 
-        # Convert to grayscale for structural metrics
         if len(original.shape) == 3:
             orig_gray = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
             den_gray = cv2.cvtColor(denoised, cv2.COLOR_BGR2GRAY)
@@ -430,7 +540,6 @@ class EnhancedBM3DDenoiser:
             orig_gray = original
             den_gray = denoised
 
-        # Enhanced SSIM approximation
         def compute_ssim_components(x, y):
             mu_x = np.mean(x)
             mu_y = np.mean(y)
@@ -446,17 +555,14 @@ class EnhancedBM3DDenoiser:
 
         ssim_approx = compute_ssim_components(orig_gray.flatten(), den_gray.flatten())
 
-        # Noise metrics
         orig_std = np.std(orig_float)
         den_std = np.std(den_float)
         noise_reduction = (orig_std - den_std) / orig_std * 100
 
-        # Edge preservation metrics
         orig_edges = cv2.Canny(orig_gray, 50, 150)
         den_edges = cv2.Canny(den_gray, 50, 150)
         edge_correlation = np.corrcoef(orig_edges.flatten(), den_edges.flatten())[0, 1]
 
-        # Texture preservation (local variance preservation)
         kernel = np.ones((5, 5), np.float32) / 25
         orig_local_var = (
             cv2.filter2D(orig_gray.astype(np.float32) ** 2, -1, kernel)
@@ -504,31 +610,24 @@ class EnhancedBM3DDenoiser:
         """
         start_time = time.time()
 
-        # Load image
         image = cv2.imread(input_path)
         if image is None:
             raise ValueError(f"Could not load image: {input_path}")
 
         logger.info(f"Processing {input_path} ({image.shape})")
 
-        # Denoise with advanced method
         denoised, metadata = self.denoise_image_advanced(image, sigma, profile)
 
-        # Compute enhanced quality metrics
         metrics = self.compute_enhanced_metrics(image, denoised)
 
-        # Add processing time
         processing_time = time.time() - start_time
         metadata["processing_time"] = processing_time
 
-        # Save denoised image
         cv2.imwrite(output_path, denoised)
         logger.info(f"Saved denoised image to {output_path} ({processing_time:.2f}s)")
 
-        # Save comparison if requested
         if save_comparison:
             comparison_path = output_path.replace(".", "_comparison.")
-            # Resize if images are too large for comparison
             if image.shape[1] > 2000:
                 scale = 2000 / image.shape[1]
                 new_width = int(image.shape[1] * scale)
@@ -577,12 +676,10 @@ class EnhancedBM3DDenoiser:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        # Find images - support both regular images and GeoTIFFs
         files = []
         for ext in [pattern, "*.tif", "*.tiff", "*.png", "*.bmp"]:
             files.extend(list(input_path.glob(ext)))
 
-        # Remove duplicates while preserving order
         seen = set()
         files = [f for f in files if not (f in seen or seen.add(f))]
 
@@ -592,17 +689,15 @@ class EnhancedBM3DDenoiser:
             logger.warning(f"No files found matching patterns")
             return []
 
-        # Adaptive worker count based on memory
         if max_workers is None:
             try:
-                available_memory = psutil.virtual_memory().available / (1024**3)  # GB
+                available_memory = psutil.virtual_memory().available / (1024**3)
                 max_workers = max(
                     1, min(4, int(available_memory / max_memory_gb), len(files))
                 )
             except:
                 max_workers = min(2, mp.cpu_count(), len(files))
 
-        # Force single worker for refilter profile to avoid BM3D threading issues
         if profile == "refilter" and max_workers > 1:
             logger.warning(
                 "Using single worker for refilter profile to avoid threading issues"
@@ -613,7 +708,6 @@ class EnhancedBM3DDenoiser:
             f"Using {max_workers} workers (available memory: {psutil.virtual_memory().available / (1024**3):.1f}GB)"
         )
 
-        # Process in batches to prevent memory exhaustion
         batch_size = max_workers * 2
         results = []
 
@@ -627,12 +721,9 @@ class EnhancedBM3DDenoiser:
             )
             results.extend(batch_results)
 
-            # Force garbage collection between batches
             gc.collect()
 
-        # Print summary
         if results:
-            # Calculate metrics for results that have them
             results_with_metrics = [
                 r
                 for r in results
@@ -683,7 +774,6 @@ class EnhancedBM3DDenoiser:
             for file_path in files:
                 output_file = output_dir / f"denoised_{file_path.name}"
 
-                # Check if it's a GeoTIFF
                 if file_path.suffix.lower() in [".tif", ".tiff"]:
                     future = executor.submit(
                         self.process_geotiff_file,
@@ -702,12 +792,11 @@ class EnhancedBM3DDenoiser:
                 futures[future] = file_path
 
             for future in futures:
-                file_path = futures[future]
+                file_path = file_path = futures[future]
                 try:
-                    result = future.result(timeout=600)  # 10-minute timeout per image
+                    result = future.result(timeout=600)
                     results.append(result)
 
-                    # Log metrics if available
                     if "quality_metrics" in result:
                         metrics = result["quality_metrics"]
                         logger.info(
@@ -781,7 +870,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Initialize enhanced denoiser
     denoiser = EnhancedBM3DDenoiser(
         enable_yuv_processing=not args.disable_yuv,
         tile_size=args.tile_size,
@@ -789,7 +877,6 @@ def main():
     )
 
     if args.batch:
-        # Batch processing
         results = denoiser.process_batch_parallel(
             args.input,
             args.output,
@@ -800,7 +887,6 @@ def main():
             max_memory_gb=args.max_memory,
         )
 
-        # Save detailed report
         if results:
             report_path = Path(args.output) / "processing_report.txt"
             with open(report_path, "w") as f:
@@ -809,24 +895,26 @@ def main():
 
                 for result in results:
                     f.write(f"File: {Path(result['input_path']).name}\n")
-                    f.write(
-                        f"Processing method: {result['processing_metadata']['processing_method']}\n"
-                    )
-                    f.write(
-                        f"Sigma used: {result['processing_metadata']['sigma_used']:.4f}\n"
-                    )
-                    f.write(f"PSNR: {result['quality_metrics']['psnr']:.2f} dB\n")
-                    f.write(
-                        f"Texture preservation: {result['quality_metrics']['texture_preservation']:.3f}\n"
-                    )
-                    f.write(
-                        f"Processing time: {result['processing_metadata']['processing_time']:.2f}s\n"
-                    )
+                    if "processing_metadata" in result:
+                        f.write(
+                            f"Processing method: {result['processing_metadata']['processing_method']}\n"
+                        )
+                        f.write(
+                            f"Sigma used: {result['processing_metadata']['sigma_used']:.4f}\n"
+                        )
+                    if "quality_metrics" in result:
+                        f.write(f"PSNR: {result['quality_metrics']['psnr']:.2f} dB\n")
+                        f.write(
+                            f"Texture preservation: {result['quality_metrics']['texture_preservation']:.3f}\n"
+                        )
+                    if "processing_metadata" in result:
+                        f.write(
+                            f"Processing time: {result['processing_metadata']['processing_time']:.2f}s\n"
+                        )
                     f.write("-" * 30 + "\n")
 
             print(f"Detailed report saved to {report_path}")
     else:
-        # Single image processing
         result = denoiser.process_single_image(
             args.input,
             args.output,
@@ -835,7 +923,6 @@ def main():
             save_comparison=args.comparison,
         )
 
-        # Print results
         metadata = result["processing_metadata"]
         metrics = result["quality_metrics"]
 
