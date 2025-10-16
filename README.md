@@ -15,8 +15,10 @@ A comprehensive suite of Python tools for image denoising and processing, optimi
   - [Enhanced BM3D Denoising](#2-enhanced-bm3d-denoising)
   - [NLM Filtering](#3-nlm-filtering-for-geotiff)
   - [Large Image Tiling](#4-large-image-tiling)
+- [Filter Selection](#filter-selection)
 - [Workflow Examples](#workflow-examples)
 - [Output Files](#output-files)
+- [Documentation](#documentation)
 - [Performance Tips](#performance-tips)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
@@ -28,6 +30,8 @@ A comprehensive suite of Python tools for image denoising and processing, optimi
 - **BM3D Denoising**: State-of-the-art block-matching 3D denoising algorithm
 - **Non-Local Means (NLM) Filtering**: Advanced spatial filtering for GeoTIFF files
 - **Large Image Tiling**: Split and process massive images without memory constraints
+- **Filter Selection**: Choose between NLM, BM3D, Enhanced BM3D, or custom filters for tile processing
+- **Automatic Script Generation**: Auto-generate processing scripts with correct filter commands
 - **Batch Processing**: Multi-threaded processing of image collections
 - **Quality Metrics**: Comprehensive evaluation of denoising results
 - **GeoTIFF Support**: Preserves spatial metadata and geographic information
@@ -227,19 +231,22 @@ python3 NLM_Filter.py input.tif output.tif nlm_ultrafast_sharp_strong
 
 ### 4. Large Image Tiling
 
-**Split massive images into tiles, process them, and merge results.**
+**Split massive images into tiles, process them with your choice of filter, and merge results.**
 
 #### Split Image into Tiles
 
 ```bash
-python3 LargeImage_Tiler.py split input_image.tif output_directory
+python3 LargeImage_Tiler.py split input_image.tif output_directory [OPTIONS]
 ```
 
 **Options:**
 
 - `--tile-size INT`: Size of each tile in pixels (default: 1024)
 - `--prefix STRING`: Prefix for tile filenames (default: tile)
-- `--create-script COMMAND`: Generate processing script
+- `--filter {nlm|bm3d|enhanced_bm3d|custom}`: Choose denoising filter (default: enhanced_bm3d)
+- `--filter-args ARGS`: Additional arguments for the selected filter
+- `--create-script`: Auto-generate processing script with correct filter commands
+- `--custom-command CMD`: Custom command for `--filter custom`
 
 #### Merge Processed Tiles
 
@@ -254,20 +261,98 @@ python3 LargeImage_Tiler.py merge metadata.json tiles_directory output_merged.ti
 #### Complete Workflow
 
 ```bash
-# Step 1: Split large image
-python3 LargeImage_Tiler.py split large_dem.tif ./tiles --tile-size 2048 --prefix dem_tile
+# Step 1: Split large image with Enhanced BM3D (default)
+python3 LargeImage_Tiler.py split large_dem.tif ./tiles --tile-size 2048 --create-script
 
-# Step 2a: Option A - Auto processing (if script was created)
+# Step 2: Process tiles automatically
 cd ./tiles
 ./process_tiles.sh
 
-# Step 2b: Option B - Manual processing
-python3 ../Enhanced_BM3D.py dem_tile_0000_0000.tif denoised_dem_tile_0000_0000.tif
-
 # Step 3: Merge back together
 cd ..
-python3 LargeImage_Tiler.py merge ./tiles/dem_tile_metadata.json ./tiles result_merged.tif
+python3 LargeImage_Tiler.py merge ./tiles/tile_metadata.json ./tiles result_merged.tif
 ```
+
+#### Filter Selection Examples
+
+```bash
+# Using NLM filter (fast)
+python3 LargeImage_Tiler.py split image.tif tiles/ --filter nlm --create-script
+
+# Using BM3D filter
+python3 LargeImage_Tiler.py split image.tif tiles/ --filter bm3d --create-script
+
+# Using Enhanced BM3D with custom arguments
+python3 LargeImage_Tiler.py split image.tif tiles/ --filter enhanced_bm3d --filter-args "--workers 4" --create-script
+
+# Using custom filter
+python3 LargeImage_Tiler.py split image.tif tiles/ --filter custom --custom-command "python3 my_denoise.py {input} {output}" --create-script
+```
+
+---
+
+## Filter Selection
+
+### Available Filters for Tile Processing
+
+When using `LargeImage_Tiler.py`, you can choose from four filter types:
+
+| Filter | Command | Speed | Quality | Best For |
+| --- | --- | --- | --- | --- |
+| **NLM** | `--filter nlm` | Fastest | Good | Quick tests, previews |
+| **BM3D** | `--filter bm3d` | Medium | Excellent | Standard denoising |
+| **Enhanced BM3D** | `--filter enhanced_bm3d` | Medium | Excellent | Production, large images (DEFAULT) |
+| **Custom** | `--filter custom --custom-command "..."` | Varies | Varies | Your own denoising tool |
+
+### Quick Start with Different Filters
+
+```bash
+# Default (Enhanced BM3D - Recommended)
+python3 LargeImage_Tiler.py split image.tif tiles/ --create-script
+
+# Fast preview (NLM)
+python3 LargeImage_Tiler.py split image.tif tiles/ --filter nlm --create-script
+
+# Standard quality (BM3D)
+python3 LargeImage_Tiler.py split image.tif tiles/ --filter bm3d --create-script
+
+# With filter arguments
+python3 LargeImage_Tiler.py split image.tif tiles/ --filter enhanced_bm3d --filter-args "--workers 4" --create-script
+```
+
+### How It Works
+
+1. Choose your filter using `--filter` option
+2. Add `--create-script` to generate `process_tiles.sh` automatically
+3. The script is created with proper commands for your chosen filter
+4. Run `./process_tiles.sh` in the tiles directory
+5. Merge results with the merge command
+
+### Filter Arguments
+
+Pass additional arguments to any filter using `--filter-args`:
+
+```bash
+python3 LargeImage_Tiler.py split image.tif tiles/ \
+  --filter enhanced_bm3d \
+  --filter-args "--workers 4 --tile-size 2048" \
+  --create-script
+```
+
+---
+
+## Documentation
+
+For detailed information about filter selection and advanced features, see:
+
+- **START_HERE.md** - Quick introduction to the new filter selection feature
+- **QUICK_REFERENCE.md** - One-line commands for each filter (5 min read)
+- **FILTER_SELECTION_GUIDE.md** - Comprehensive guide with best practices (15 min read)
+- **COMMAND_REFERENCE.md** - Complete command reference with 10+ examples (10 min read)
+- **ARCHITECTURE.md** - Technical implementation details (20 min read)
+- **IMPLEMENTATION_SUMMARY.md** - What changed in the latest version (10 min read)
+- **README_FILTER_SELECTION.md** - Documentation index
+- **example_filter_usage.sh** - Copy-paste ready examples
 
 ---
 
@@ -286,7 +371,49 @@ Result: `clean_photo.jpg` and `clean_photo_comparison.jpg`
 
 ---
 
-### Scenario 2: Batch Processing Directory with Quality Metrics
+### Scenario 2: Preview Large Image with NLM (Fast)
+
+**Time: 5-15 minutes depending on image size**
+
+```bash
+source venv/bin/activate
+
+# Split with fast NLM filter for quick preview
+python3 LargeImage_Tiler.py split large_image.tif preview_tiles/ --filter nlm --create-script
+
+# Process tiles
+cd preview_tiles/
+./process_tiles.sh
+cd ..
+
+# Merge to check results
+python3 LargeImage_Tiler.py merge preview_tiles/tile_metadata.json preview_tiles/ preview_output.tif
+```
+
+---
+
+### Scenario 3: Process Large Image with Enhanced BM3D (High Quality)
+
+**Time: 30+ minutes depending on system**
+
+```bash
+source venv/bin/activate
+
+# Split with Enhanced BM3D (default, best quality)
+python3 LargeImage_Tiler.py split large_dem.tif final_tiles/ --tile-size 2048 --create-script
+
+# Process tiles
+cd final_tiles/
+./process_tiles.sh
+cd ..
+
+# Merge results
+python3 LargeImage_Tiler.py merge final_tiles/tile_metadata.json final_tiles/ final_output.tif
+```
+
+---
+
+### Scenario 4: Batch Processing Directory with Quality Metrics
 
 **Time: Varies by number of images and image size**
 
@@ -299,31 +426,7 @@ Results: Denoised images in `./clean_images/` with quality report
 
 ---
 
-### Scenario 3: Processing Very Large GeoTIFF (50000x50000px)
-
-**Time: 30+ minutes depending on system**
-
-```bash
-source venv/bin/activate
-
-# Split into manageable tiles
-python3 LargeImage_Tiler.py split dem_50000x50000.tif ./dem_tiles --tile-size 2048
-
-# Process tiles
-cd dem_tiles
-for tile in dem_tile_*.tif; do
-    echo "Processing $tile..."
-    python3 ../Enhanced_BM3D.py "$tile" "denoised_$tile" --profile np
-done
-cd ..
-
-# Merge results
-python3 LargeImage_Tiler.py merge ./dem_tiles/dem_tile_metadata.json ./dem_tiles dem_final.tif
-```
-
----
-
-### Scenario 4: NLM Filtering GeoTIFF DEM Data
+### Scenario 5: NLM Filtering GeoTIFF DEM Data
 
 **Time: 5-20 minutes depending on method and size**
 
@@ -338,6 +441,30 @@ python3 NLM_Filter.py dem_original.tif dem_filtered.tif nlm_fast
 
 # For maximum quality (slowest)
 python3 NLM_Filter.py dem_original.tif dem_filtered.tif nlm
+```
+
+---
+
+### Scenario 6: Using Custom Filter with Tiling
+
+**Time: Varies based on custom filter**
+
+```bash
+source venv/bin/activate
+
+# Split with custom filter command
+python3 LargeImage_Tiler.py split image.tif tiles/ \
+  --filter custom \
+  --custom-command "python3 my_denoise.py {input} {output}" \
+  --create-script
+
+# Process tiles
+cd tiles/
+./process_tiles.sh
+cd ..
+
+# Merge results
+python3 LargeImage_Tiler.py merge tiles/tile_metadata.json tiles/ output.tif
 ```
 
 ---
@@ -406,6 +533,7 @@ pip install large-image[common]
 - Switch from `--profile refilter` to `--profile np`
 - Increase `--workers` if RAM available
 - Reduce image resolution or tile size
+- Choose NLM filter with `--filter nlm` for quick processing
 
 ### Processing hangs or freezes
 
@@ -413,6 +541,25 @@ pip install large-image[common]
 - Verify input file is not corrupted
 - Try processing smaller tile size
 - Monitor system resources (CPU, RAM, I/O)
+
+### Custom filter not working
+
+- Verify filter command works standalone: `python3 my_filter.py test_input.tif test_output.tif`
+- Use proper placeholders: `{input}` and `{output}` in custom command
+- Check that files can be read/written from the tiles directory
+- See `FILTER_SELECTION_GUIDE.md` for custom filter examples
+
+### Script generation failing
+
+**Solution:** Make sure `--create-script` is used without a value (it's a flag):
+
+```bash
+# Correct
+python3 LargeImage_Tiler.py split image.tif tiles/ --create-script
+
+# Incorrect
+python3 LargeImage_Tiler.py split image.tif tiles/ --create-script some_command
+```
 
 ---
 

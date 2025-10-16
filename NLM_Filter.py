@@ -24,12 +24,18 @@ def load_rgb_geotiff(image_path):
     print("Converting image format...")
     image = reshape_as_image(image)
 
-    # Ensure we only take RGB channels and normalize to 0-1 range
-    if image.shape[2] >= 3:
+    # Handle single-channel (grayscale) images by duplicating to RGB
+    if image.ndim == 2:
+        print("Converting grayscale to RGB by duplicating channel...")
+        image = np.stack([image, image, image], axis=2)
+    elif image.shape[2] == 1:
+        print("Converting single-channel to RGB by duplicating channel...")
+        image = np.stack([image[:, :, 0], image[:, :, 0], image[:, :, 0]], axis=2)
+    elif image.shape[2] >= 3:
         image = image[:, :, :3]  # Take only first 3 channels (RGB)
     else:
         raise ValueError(
-            f"Image only has {image.shape[2]} channels, need at least 3 for RGB"
+            f"Image only has {image.shape[2]} channels, need at least 1 for grayscale or 3 for RGB"
         )
 
     print("Normalizing image data...")
@@ -256,12 +262,12 @@ def save_to_geotiff(filtered_rgb, profile, transform, crs, output_path):
         "nodata": None,
         "width": filtered_rgb.shape[2],
         "height": filtered_rgb.shape[1],
-        "count": 3,  # Exactly 3 channels for RGB
+        "count": 3,  # Output as 3 channels for RGB
         "crs": crs,
         "transform": transform,
         "compress": "deflate",
         "tiled": False,
-        "interleave": "pixel",  # Change to pixel interleave for better RGB support
+        "interleave": "pixel",  # Pixel interleave for RGB support
         "photometric": "rgb",  # Explicitly specify RGB photometric interpretation
     }
 

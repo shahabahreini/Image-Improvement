@@ -289,13 +289,21 @@ class LargeImageTiler:
         logger.info(f"Merge complete! Output saved to {output_path}")
         logger.info(f"Successfully merged {tiles_processed} tiles")
 
-    def create_processing_script(self, tiles_dir: str, denoising_command: str) -> str:
+    def create_processing_script(
+        self,
+        tiles_dir: str,
+        denoising_command: str,
+        filter_type: str = "enhanced_bm3d",
+        filter_args: Optional[str] = None,
+    ) -> str:
         """
         Generate a batch processing script for all tiles.
 
         Args:
             tiles_dir: Directory containing tiles
-            denoising_command: Base command for processing
+            denoising_command: Base command or script name for processing
+            filter_type: Type of filter to use ('nlm', 'bm3d', 'enhanced_bm3d')
+            filter_args: Additional arguments to pass to the filter
 
         Returns:
             Path to generated script
@@ -318,9 +326,30 @@ class LargeImageTiler:
         # Generate processing script
         script_path = tiles_dir / "process_tiles.sh"
 
+        # Determine filter command based on filter_type
+        if filter_type.lower() == "nlm":
+            filter_script = "NLM_Filter .py"
+            filter_cmd_template = (
+                f'python3 "{filter_script}" "{{input}}" "{{output}}" nlm_ultrafast'
+            )
+        elif filter_type.lower() == "bm3d":
+            filter_script = "Basic_BM3D.py"
+            filter_cmd_template = (
+                f'python3 "{filter_script}" "{{input}}" "{{output}}" --profile refilter'
+            )
+        elif filter_type.lower() == "enhanced_bm3d":
+            filter_script = "Enhanced_BM3D.py"
+            filter_cmd_template = (
+                f'python3 "{filter_script}" "{{input}}" "{{output}}" --profile refilter'
+            )
+        else:
+            # Use custom command if provided
+            filter_cmd_template = denoising_command
+
         with open(script_path, "w") as f:
             f.write("#!/bin/bash\n")
             f.write(f"# Auto-generated tile processing script\n")
+            f.write(f"# Filter type: {filter_type}\n")
             f.write(f"# Found {len(tile_files)} tiles to process\n\n")
             f.write("set -e  # Exit on any error\n\n")
 
@@ -329,9 +358,21 @@ class LargeImageTiler:
                 output_name = f"denoised_{input_name}"
 
                 f.write(f'echo "Processing tile {i}/{len(tile_files)}: {input_name}"\n')
-                f.write(
-                    f'{denoising_command} "{input_name}" "{output_name}" --profile refilter\n'
-                )
+
+                # Build the filter command
+                if filter_type.lower() in ["nlm", "bm3d", "enhanced_bm3d"]:
+                    filter_cmd = filter_cmd_template.format(
+                        input=input_name, output=output_name
+                    )
+                else:
+                    filter_cmd = filter_cmd_template.replace(
+                        "{input}", input_name
+                    ).replace("{output}", output_name)
+
+                if filter_args:
+                    filter_cmd += f" {filter_args}"
+
+                f.write(f"{filter_cmd}\n")
                 f.write(f"if [ $? -ne 0 ]; then\n")
                 f.write(f'    echo "Failed to process {input_name}"\n')
                 f.write(f"    exit 1\n")
@@ -343,6 +384,7 @@ class LargeImageTiler:
         script_path.chmod(0o755)
 
         logger.info(f"Processing script created: {script_path}")
+        logger.info(f"Using filter: {filter_type}")
 
         return str(script_path)
 
@@ -367,7 +409,23 @@ def main():
         "--prefix", default="tile", help="Prefix for tile filenames"
     )
     split_parser.add_argument(
-        "--create-script", help="Create processing script with this command"
+        "--filter",
+        choices=["nlm", "bm3d", "enhanced_bm3d", "custom"],
+        default="enhanced_bm3d",
+        help="Filter to apply after tiling (nlm, bm3d, enhanced_bm3d, or custom command)",
+    )
+    split_parser.add_argument(
+        "--filter-args",
+        help="Additional arguments to pass to the filter script",
+    )
+    split_parser.add_argument(
+        "--create-script",
+        action="store_true",
+        help="Create processing script for the selected filter",
+    )
+    split_parser.add_argument(
+        "--custom-command",
+        help="Custom command to use if --filter is set to custom",
     )
 
     # Merge command
@@ -403,8 +461,17 @@ def main():
 
             # Create processing script if requested
             if args.create_script:
+                if args.filter == "custom" and not args.custom_command:
+                    print("Error: --custom-command required when using --filter custom")
+                    return 1
+
+                custom_cmd = args.custom_command if args.filter == "custom" else None
+
                 script_path = tiler.create_processing_script(
-                    args.output_dir, args.create_script
+                    args.output_dir,
+                    custom_cmd or "",
+                    filter_type=args.filter,
+                    filter_args=args.filter_args,
                 )
                 print(f"Processing script created: {script_path}")
                 print(f"\nTo process all tiles:")
